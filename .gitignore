@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Temporary files
+*.log
+tmp_*.html
+*.tmp
+
+# Android build and local files
+android/app/build/
+android/.gradle/
+android/local.properties
+android/captures/
+.bundle/
+
+# Capacitor
+/www
+/android/app/src/main/assets/capacitor.plugins.json
+/android/app/src/main/assets/public
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Project-specific scrap
+Codigo.txt
+"Nuevo documento de texto.txt"
+"PeliStream -.sublime-workspace"
+"PeliStream -.sublime-project"

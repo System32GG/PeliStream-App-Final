@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="PelisStream - Ver películas y series online gratis en HD">
+  <title>PelisStream — Películas y Series Online</title>
+  <!-- Popup / redirect blocker: prevents iframes from opening new windows in the parent context -->
+  <script>
+    // Override window.open so iframes cannot spawn pop-under ad windows
+    const _origOpen = window.open.bind(window);
+    window.open = function(url, name, specs) {
+      // Allow about:blank (used internally by some players)
+      if (!url || url === '' || url === 'about:blank') return _origOpen(url, name, specs);
+      // Block known ad URL patterns
+      const adPatterns = [/\?var=[a-z0-9]+$/i, /bannister/i, /attirecider/i, /adfly/i, /shorte\.st/i, /ouo\.io/i, /linkvertise/i, /popcash/i, /popads/i];
+      if (adPatterns.some(p => p.test(url))) {
+        console.warn('[PelisStream] Blocked popup:', url);
+        return null;
+      }
+      return _origOpen(url, name, specs);
+    };
+
+    // Block iframes from navigating the top-level page via window.top / window.parent
+    window.addEventListener('message', function(e) {
+      if (e.data && typeof e.data === 'string' && e.data.startsWith('http')) {
+        const adPatterns = [/\?var=[a-z0-9]+/i, /bannister/i, /adfly/i];
+        if (adPatterns.some(p => p.test(e.data))) e.stopImmediatePropagation();
+      }
+    }, true);
+  </script>
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎬</text></svg>">
+</head>
+<body>
+
+  <!-- HEADER -->
+  <header class="header">
+    <div class="header-inner">
+      <a href="/" class="logo" onclick="goHome(event)">
+        <span class="logo-icon">🎬</span>
+        <span>PelisStream</span>
+      </a>
+
+      <div class="search-box">
+        <span class="search-icon">🔍</span>
+        <input type="text" id="searchInput" placeholder="Buscar películas, series, anime…" autocomplete="off">
+      </div>
+
+      <div class="header-actions">
+        <div class="source-tabs" id="sourceTabs">
+          <button class="source-tab active" data-source="pelisplus">PelisPlus</button>
+          <button class="source-tab" data-source="poseidon">PoseidonHD</button>
+          <button class="source-tab" data-source="pelisplus_la">PelisPlus.la</button>
+          <button class="source-tab" data-source="cuevana">Cuevana3</button>
+          <button class="source-tab" data-source="all">Todos</button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <!-- NAV -->
+  <nav class="nav-bar">
+    <div class="nav-tabs" id="navTabs">
+      <button class="nav-tab active" data-type="movies">🎬 Películas</button>
+      <button class="nav-tab" data-type="series">📺 Series</button>
+      <button class="nav-tab" data-type="history">🕒 Historial</button>
+    </div>
+  </nav>
+
+  <!-- MAIN CONTENT -->
+  <main class="main" id="mainContent">
+    <!-- Dynamic content loaded here -->
+  </main>
+
+  <!-- MODAL -->
+  <div class="modal-overlay" id="modalOverlay">
+    <div class="modal" id="modal">
+      <button class="modal-close" id="modalClose" title="Cerrar">✕</button>
+      
+      <div class="player-container" id="playerContainer">
+        <div class="player-placeholder" id="playerPlaceholder">
+          <div class="play-big" id="playBig">▶</div>
+          <span>Selecciona un servidor para reproducir</span>
+        </div>
+      </div>
+
+      <div class="modal-content-scroll" tabindex="0">
+        <div class="server-section" id="serverSection" style="display:none">
+          <div class="section-label">📡 Servidores Disponibles</div>
+          <div class="server-list" id="serverList">
+            <!-- Servers will be injected here -->
+          </div>
+        </div>
+
+        <div class="movie-detail-info">
+          <div class="detail-header">
+            <h2 class="detail-title" id="detailTitle">Cargando…</h2>
+            <div class="detail-meta" id="detailMeta">
+              <!-- Meta info -->
+            </div>
+          </div>
+
+          <div class="detail-genres" id="detailGenres">
+            <!-- Genres -->
+          </div>
+
+          <p class="detail-description" id="detailDescription">
+            Cargando información…
+          </p>
+
+          <div class="detail-actions">
+            <a href="#" target="_blank" rel="noopener" class="detail-link" id="detailLink">
+              🌐 Ver en web original
+            </a>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/scraper.js?v=7"></script>
+  <script src="/app.js?v=7"></script>
+</body>
+</html>
