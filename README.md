@@ -32,15 +32,6 @@ Antes de ejecutar cualquier comando, debes descargar e instalar manualmente:
 - `/icons`: Activos visuales del proyecto.
 - `/tests`: Pruebas automatizadas.
 
-## 🛠️ Mejoras Recientes
-
-- **Seguridad**: Sanitización de inputs en servidor y móvil para evitar inyecciones.
-- **Rendimiento**: 
-    - Caché de 30-60 min en el servidor.
-    - Caché local (localStorage) en Android para cargas instantáneas.
-- **Android TV**: Soporte para Launcher Leanback y Banner personalizado para que aparezca en el inicio de la TV.
-- **Rate Limiting**: Protección global contra abuso de la API (60 req/min).
-
 ## 📝 Notas
 - El archivo `config.json` se sincroniza automáticamente desde un GitHub Gist cada 30 minutos.
 - Las dependencias están fijas a versiones exactas para evitar fallos por actualizaciones automáticas.
