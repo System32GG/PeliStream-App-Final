@@ -83,7 +83,60 @@ _initRemoteConfig();
 
 // ─── Shared utils ────────────────────────────────────────────────
 
+// Sanitization: Strips dangerous characters to prevent XSS from source sites
+function _sanitize(str) {
+  if (typeof str !== 'string') return '';
+  return str.replace(/[<>"'`;\\{}|^[\]]/g, '').trim();
+}
+
+// Local Cache: Stores results in localStorage for 30 minutes
+async function _withCache(key, fetcher) {
+  try {
+    const cached = localStorage.getItem('ps_cache_' + key);
+    if (cached) {
+      const { data, expiry } = JSON.parse(cached);
+      if (Date.now() < expiry) {
+        console.log(`[PelisStream] Cache Hit: ${key}`);
+        return data;
+      }
+    }
+  } catch (e) {
+    console.warn("[PelisStream] Cache read error:", e);
+  }
+
+  const data = await fetcher();
+  if (data) {
+    try {
+      localStorage.setItem('ps_cache_' + key, JSON.stringify({
+        data,
+        expiry: Date.now() + (30 * 60 * 1000) // 30 minutes
+      }));
+    } catch (e) {
+      console.warn("[PelisStream] Cache write error (possibly quota exceeded):", e);
+    }
+  }
+  return data;
+}
+
+// Domain Whitelist for Scraping (Safety check for standalone mode)
+const _ALLOWED_SCRAPE_DOMAINS = [
+  'pelisplushd.bz', 'pelisplus.app', 'pelisplushd.net',
+  'poseidonhd2.co', 'poseidonhd.co', 'pelisplushd.la',
+  'cuevana3.to', 'cuevana3.com', 'cuevana', 'gist.githubusercontent.com'
+];
+
+function _isDomainAllowed(url) {
+  try {
+    const host = new URL(url).hostname.replace('www.', '');
+    return _ALLOWED_SCRAPE_DOMAINS.some(d => host.endsWith(d));
+  } catch { return false; }
+}
+
 async function _fetch(url) {
+  if (!_isDomainAllowed(url)) {
+    console.error("[PelisStream] Scrape blocked: Domain not in whitelist", url);
+    return null;
+  }
   const res = await fetch(url, {
     headers: {
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -93,7 +146,6 @@ async function _fetch(url) {
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.text();
 }
-
 function _doc(html) {
   return new DOMParser().parseFromString(html, 'text/html');
 }
@@ -302,7 +354,7 @@ function _ppMovies(doc) {
     if (!img && !a.closest('article,.post,.card,.item,.Posters,.items')) continue;
     if (!image) continue;
     const titleEl = _qs(a, 'h2,h3,.Title,.title,.entry-title');
-    let title = _text(titleEl) || _attr(a, 'title') || _attr(img, 'alt') || _text(a);
+    let title = _sanitize(_text(titleEl) || _attr(a, 'title') || _attr(img, 'alt') || _text(a));
     let year = ''; const ym = title.match(/\((\d{4})\)/); if (ym) year = ym[1];
     if (!year) { const ys = _qs(a, '.Year,.year,span'); if (ys) { const y2 = _text(ys).match(/(\d{4})/); if (y2) year = y2[1]; } }
     let type = href.includes('/serie/') ? 'series' : href.includes('/anime/') ? 'anime' : 'movie';
@@ -314,35 +366,41 @@ function _ppMovies(doc) {
 }
 
 SCRAPERS.pelisplus = {
-  async getLatest(page = 1) { const h = await _ppFetch(page > 1 ? `${_ppBase}/peliculas?page=${page}` : `${_ppBase}/peliculas`); return h ? _ppMovies(_doc(h)) : []; },
-  async getLatestSeries(page = 1) { const h = await _ppFetch(page > 1 ? `${_ppBase}/series?page=${page}` : `${_ppBase}/series`); return h ? _ppMovies(_doc(h)) : []; },
+  async getLatest(page = 1) { return _withCache(`pp_latest_${page}`, async () => { const h = await _ppFetch(page > 1 ? `${_ppBase}/peliculas?page=${page}` : `${_ppBase}/peliculas`); return h ? _ppMovies(_doc(h)) : []; }); },
+  async getLatestSeries(page = 1) { return _withCache(`pp_latest_series_${page}`, async () => { const h = await _ppFetch(page > 1 ? `${_ppBase}/series?page=${page}` : `${_ppBase}/series`); return h ? _ppMovies(_doc(h)) : []; }); },
 
   async search(query) {
-    for (const u of [`${_ppBase}/search?s=${encodeURIComponent(query)}`, `${_ppBase}/?s=${encodeURIComponent(query)}`]) {
-      const h = await _ppFetch(u); if (!h) continue;
-      const r = _ppMovies(_doc(h)); if (r.length) return r;
-    }
-    return [];
+    return _withCache(`pp_search_${query}`, async () => {
+      for (const u of [`${_ppBase}/search?s=${encodeURIComponent(query)}`, `${_ppBase}/?s=${encodeURIComponent(query)}`]) {
+        const h = await _ppFetch(u); if (!h) continue;
+        const r = _ppMovies(_doc(h)); if (r.length) return r;
+      }
+      return [];
+    });
   },
 
   async getDetail(url) {
-    const html = await _ppFetch(url); if (!html) return null;
-    const doc = _doc(html); const isSeries = url.includes('/serie/') || url.includes('/anime/');
-    const res = { title: '', year: '', image: '', description: '', genres: [], servers: [], seasons: [], type: isSeries ? 'series' : 'movie', url, source: 'pelisplus' };
-    res.title = _text(_qs(doc, 'h1')) || _text(_qs(doc, 'h2.Title,.Title h2')) || '';
-    const ogI = _qs(doc, 'meta[property="og:image"]');
-    res.image = _fixImg(ogI ? _attr(ogI, 'content') : (_attr(_qs(doc, 'img.TPostBg,.TPost img,.poster img,.sheader img'), 'data-src') || _attr(_qs(doc, 'img.TPostBg,.TPost img,.poster img'), 'src') || ''), _ppBase);
-    res.description = _attr(_qs(doc, 'meta[property="og:description"]'), 'content') || _attr(_qs(doc, 'meta[name="description"]'), 'content') || '';
-    for (const a of _qsa(doc, 'a[href*="/genero/"],a[href*="/generos/"]')) { const g = _text(a); if (g && g.length > 1 && g.length < 30 && !res.genres.includes(g)) res.genres.push(g); }
-    res.genres = res.genres.slice(0, 6);
-    const ym = res.title.match(/\((\d{4})\)/) || _text(_qs(doc, 'span.year,.Year')).match(/(\d{4})/); if (ym) res.year = ym[1];
-    if (isSeries) _extractSeasons(doc, res, _ppBase); else _extractServers(doc, html, res);
-    return res;
+    return _withCache(`detail_${url}`, async () => {
+      const html = await _ppFetch(url); if (!html) return null;
+      const doc = _doc(html); const isSeries = url.includes('/serie/') || url.includes('/anime/');
+      const res = { title: '', year: '', image: '', description: '', genres: [], servers: [], seasons: [], type: isSeries ? 'series' : 'movie', url, source: 'pelisplus' };
+      res.title = _sanitize(_text(_qs(doc, 'h1')) || _text(_qs(doc, 'h2.Title,.Title h2')) || '');
+      const ogI = _qs(doc, 'meta[property="og:image"]');
+      res.image = _fixImg(ogI ? _attr(ogI, 'content') : (_attr(_qs(doc, 'img.TPostBg,.TPost img,.poster img,.sheader img'), 'data-src') || _attr(_qs(doc, 'img.TPostBg,.TPost img,.poster img'), 'src') || ''), _ppBase);
+      res.description = _sanitize(_attr(_qs(doc, 'meta[property="og:description"]'), 'content') || _attr(_qs(doc, 'meta[name="description"]'), 'content') || '');
+      for (const a of _qsa(doc, 'a[href*="/genero/"],a[href*="/generos/"]')) { const g = _text(a); if (g && g.length > 1 && g.length < 30 && !res.genres.includes(g)) res.genres.push(g); }
+      res.genres = res.genres.slice(0, 6);
+      const ym = res.title.match(/\((\d{4})\)/) || _text(_qs(doc, 'span.year,.Year')).match(/(\d{4})/); if (ym) res.year = ym[1];
+      if (isSeries) _extractSeasons(doc, res, _ppBase); else _extractServers(doc, html, res);
+      return res;
+    });
   },
 
   async getEpisodeServers(url) {
-    const html = await _ppFetch(url); if (!html) return [];
-    const tmp = { servers: [] }; _extractServers(_doc(html), html, tmp); return tmp.servers;
+    return _withCache(`ep_${url}`, async () => {
+      const html = await _ppFetch(url); if (!html) return [];
+      const tmp = { servers: [] }; _extractServers(_doc(html), html, tmp); return tmp.servers;
+    });
   }
 };
 
@@ -384,38 +442,44 @@ function _posMovies(doc) {
 }
 
 SCRAPERS.poseidon = {
-  async getLatest(page = 1) { const h = await _posFetch(page > 1 ? `${_posBase}/peliculas/page/${page}` : `${_posBase}/peliculas`); return h ? _posMovies(_doc(h)) : []; },
-  async getLatestSeries(page = 1) { const h = await _posFetch(page > 1 ? `${_posBase}/series/page/${page}` : `${_posBase}/series`); return h ? _posMovies(_doc(h)) : []; },
+  async getLatest(page = 1) { return _withCache(`pos_latest_${page}`, async () => { const h = await _posFetch(page > 1 ? `/peliculas/page/${page}` : `/peliculas`); return h ? _posMovies(_doc(h)) : []; }); },
+  async getLatestSeries(page = 1) { return _withCache(`pos_latest_series_${page}`, async () => { const h = await _posFetch(page > 1 ? `/series/page/${page}` : `/series`); return h ? _posMovies(_doc(h)) : []; }); },
 
   async search(query) {
-    for (const u of [`${_posBase}/?s=${encodeURIComponent(query)}`, `${_posBase}/search?s=${encodeURIComponent(query)}`]) {
-      const h = await _posFetch(u); if (!h) continue;
-      const r = _posMovies(_doc(h)); if (r.length) return r;
-    }
-    return [];
+    return _withCache(`pos_search_${query}`, async () => {
+      for (const u of [`/?s=${encodeURIComponent(query)}`, `/search?s=${encodeURIComponent(query)}`]) {
+        const h = await _posFetch(u); if (!h) continue;
+        const r = _posMovies(_doc(h)); if (r.length) return r;
+      }
+      return [];
+    });
   },
 
   async getDetail(url) {
-    const html = await _posFetch(url); if (!html) return null;
-    const doc = _doc(html); const isSeries = url.includes('/serie/');
-    const res = { title: '', year: '', image: '', description: '', genres: [], servers: [], seasons: [], type: isSeries ? 'series' : 'movie', url, source: 'poseidon' };
-    res.title = _text(_qs(doc, 'h1')) || _text(_qs(doc, 'h2.Title,.Title h2')) || '';
-    const ogI = _qs(doc, 'meta[property="og:image"]');
-    res.image = _fixImg(ogI ? _attr(ogI, 'content') : (_attr(_qs(doc, '.poster img,.sheader img,.TPost img,article img'), 'data-src') || _attr(_qs(doc, '.poster img,.sheader img'), 'src') || ''), _posBase);
-    res.description = _attr(_qs(doc, 'meta[property="og:description"]'), 'content') || _attr(_qs(doc, 'meta[name="description"]'), 'content') || '';
-    for (const a of _qsa(doc, 'a[href*="/genero/"],a[href*="/generos/"]')) { const g = _text(a); if (g && g.length > 1 && g.length < 30 && !res.genres.includes(g)) res.genres.push(g); }
-    res.genres = res.genres.slice(0, 6);
-    const ym = res.title.match(/\((\d{4})\)/) || _text(_qs(doc, 'span.year,.Year,.extra span')).match(/(\d{4})/); if (ym) res.year = ym[1];
-    // Poseidon player URL
-    const ppat = /https?:\/\/player\.poseidonhd2?\.co\/[^"'\s<>]+/gi;
-    for (let m of (html.match(ppat) || [])) { m = m.replace(/["'\\;,)\]}>]+$/, ''); if (!_isAd(m) && !res.servers.find(s => s.embedUrl === m)) res.servers.push({ name: m.includes('download') ? 'Descargar' : 'PoseidonPlayer', embedUrl: m }); }
-    if (isSeries) _extractSeasons(doc, res, _posBase); else _extractServers(doc, html, res);
-    return res;
+    return _withCache(`detail_${url}`, async () => {
+      const html = await _posFetch(url); if (!html) return null;
+      const doc = _doc(html); const isSeries = url.includes('/serie/');
+      const res = { title: '', year: '', image: '', description: '', genres: [], servers: [], seasons: [], type: isSeries ? 'series' : 'movie', url, source: 'poseidon' };
+      res.title = _sanitize(_text(_qs(doc, 'h1')) || _text(_qs(doc, 'h2.Title,.Title h2')) || '');
+      const ogI = _qs(doc, 'meta[property="og:image"]');
+      res.image = _fixImg(ogI ? _attr(ogI, 'content') : (_attr(_qs(doc, '.poster img,.sheader img,.TPost img,article img'), 'data-src') || _attr(_qs(doc, '.poster img,.sheader img'), 'src') || ''), _posBase);
+      res.description = _sanitize(_attr(_qs(doc, 'meta[property="og:description"]'), 'content') || _attr(_qs(doc, 'meta[name="description"]'), 'content') || '');
+      for (const a of _qsa(doc, 'a[href*="/genero/"],a[href*="/generos/"]')) { const g = _text(a); if (g && g.length > 1 && g.length < 30 && !res.genres.includes(g)) res.genres.push(g); }
+      res.genres = res.genres.slice(0, 6);
+      const ym = res.title.match(/\((\d{4})\)/) || _text(_qs(doc, 'span.year,.Year,.extra span')).match(/(\d{4})/); if (ym) res.year = ym[1];
+      // Poseidon player URL
+      const ppat = /https?:\/\/player\.poseidonhd2?\.co\/[^"'\s<>]+/gi;
+      for (let m of (html.match(ppat) || [])) { m = m.replace(/["'\\;,)\]}>]+$/, ''); if (!_isAd(m) && !res.servers.find(s => s.embedUrl === m)) res.servers.push({ name: m.includes('download') ? 'Descargar' : 'PoseidonPlayer', embedUrl: m }); }
+      if (isSeries) _extractSeasons(doc, res, _posBase); else _extractServers(doc, html, res);
+      return res;
+    });
   },
 
   async getEpisodeServers(url) {
-    const html = await _posFetch(url); if (!html) return [];
-    const tmp = { servers: [] }; _extractServers(_doc(html), html, tmp); return tmp.servers;
+    return _withCache(`ep_${url}`, async () => {
+      const html = await _posFetch(url); if (!html) return [];
+      const tmp = { servers: [] }; _extractServers(_doc(html), html, tmp); return tmp.servers;
+    });
   }
 };
 
@@ -447,32 +511,38 @@ function _pplaMovies(doc) {
 }
 
 SCRAPERS.pelisplus_la = {
-  async getLatest(page = 1) { const h = await _pplaFetch(page > 1 ? `/peliculas?page=${page}` : `/peliculas`); return h ? _pplaMovies(_doc(h)) : []; },
-  async getLatestSeries(page = 1) { const h = await _pplaFetch(page > 1 ? `/series?page=${page}` : `/series`); return h ? _pplaMovies(_doc(h)) : []; },
+  async getLatest(page = 1) { return _withCache(`ppla_latest_${page}`, async () => { const h = await _pplaFetch(page > 1 ? `/peliculas?page=${page}` : `/peliculas`); return h ? _pplaMovies(_doc(h)) : []; }); },
+  async getLatestSeries(page = 1) { return _withCache(`ppla_latest_series_${page}`, async () => { const h = await _pplaFetch(page > 1 ? `/series?page=${page}` : `/series`); return h ? _pplaMovies(_doc(h)) : []; }); },
   async search(query) {
-    let h = await _pplaFetch(`/buscar?q=${encodeURIComponent(query)}`);
-    let m = h ? _pplaMovies(_doc(h)) : [];
-    if(m.length) return m;
-    h = await _pplaFetch(`/search?s=${encodeURIComponent(query)}`);
-    return h ? _pplaMovies(_doc(h)) : [];
+    return _withCache(`ppla_search_${query}`, async () => {
+      let h = await _pplaFetch(`/buscar?q=${encodeURIComponent(query)}`);
+      let m = h ? _pplaMovies(_doc(h)) : [];
+      if(m.length) return m;
+      h = await _pplaFetch(`/search?s=${encodeURIComponent(query)}`);
+      return h ? _pplaMovies(_doc(h)) : [];
+    });
   },
   async getDetail(url) {
-    const html = await _pplaFetch(url); if (!html) return null;
-    const doc = _doc(html); const isSeries = url.includes('/serie/') || url.includes('/anime/');
-    const res = { title: '', year: '', image: '', description: '', genres: [], servers: [], seasons: [], type: isSeries ? 'series' : 'movie', url, source: 'pelisplus_la' };
-    res.title = _text(_qs(doc, 'h1')) || _text(_qs(doc, 'title')).split('|')[0].trim();
-    const ogI = _qs(doc, 'meta[property="og:image"]');
-    res.image = _fixImg(ogI ? _attr(ogI, 'content') : (_attr(_qs(doc, 'img.TPostBg,.poster img'), 'data-src') || _attr(_qs(doc, 'img.TPostBg,.poster img'), 'src')), PPLA_BASE);
-    res.description = _attr(_qs(doc, 'meta[property="og:description"]'), 'content') || _text(_qs(doc, '.Description p,.sinopsis p'));
-    for (const a of _qsa(doc, 'a[href*="/generos/"],a[href*="/genero/"]')) { const g = _text(a); if (g && !res.genres.includes(g)) res.genres.push(g); }
-    res.genres = res.genres.slice(0, 6);
-    const ym = res.title.match(/\((\d{4})\)/) || _text(_qs(doc, '.date,.year')).match(/(\d{4})/); if (ym) res.year = ym[1];
-    if (isSeries) _extractSeasons(doc, res, PPLA_BASE); else _extractServers(doc, html, res);
-    return res;
+    return _withCache(`detail_${url}`, async () => {
+      const html = await _pplaFetch(url); if (!html) return null;
+      const doc = _doc(html); const isSeries = url.includes('/serie/') || url.includes('/anime/');
+      const res = { title: '', year: '', image: '', description: '', genres: [], servers: [], seasons: [], type: isSeries ? 'series' : 'movie', url, source: 'pelisplus_la' };
+      res.title = _sanitize(_text(_qs(doc, 'h1')) || _text(_qs(doc, 'title')).split('|')[0].trim());
+      const ogI = _qs(doc, 'meta[property="og:image"]');
+      res.image = _fixImg(ogI ? _attr(ogI, 'content') : (_attr(_qs(doc, 'img.TPostBg,.poster img'), 'data-src') || _attr(_qs(doc, 'img.TPostBg,.poster img'), 'src')), PPLA_BASE);
+      res.description = _sanitize(_attr(_qs(doc, 'meta[property="og:description"]'), 'content') || _text(_qs(doc, '.Description p,.sinopsis p')));
+      for (const a of _qsa(doc, 'a[href*="/generos/"],a[href*="/genero/"]')) { const g = _text(a); if (g && !res.genres.includes(g)) res.genres.push(g); }
+      res.genres = res.genres.slice(0, 6);
+      const ym = res.title.match(/\((\d{4})\)/) || _text(_qs(doc, '.date,.year')).match(/(\d{4})/); if (ym) res.year = ym[1];
+      if (isSeries) _extractSeasons(doc, res, PPLA_BASE); else _extractServers(doc, html, res);
+      return res;
+    });
   },
   async getEpisodeServers(url) {
-    const html = await _pplaFetch(url); if (!html) return [];
-    const tmp = { servers: [] }; _extractServers(_doc(html), html, tmp); return tmp.servers;
+    return _withCache(`ep_${url}`, async () => {
+      const html = await _pplaFetch(url); if (!html) return [];
+      const tmp = { servers: [] }; _extractServers(_doc(html), html, tmp); return tmp.servers;
+    });
   }
 };
 
@@ -504,44 +574,48 @@ function _cuevMovies(doc) {
 }
 
 SCRAPERS.cuevana = {
-  async getLatest(page = 1) { const h = await _cuevFetch(page > 1 ? `/peliculas/page/${page}` : `/peliculas`); return h ? _cuevMovies(_doc(h)) : []; },
-  async getLatestSeries(page = 1) { const h = await _cuevFetch(page > 1 ? `/serie/page/${page}` : `/serie`); return h ? _cuevMovies(_doc(h)) : []; },
-  async search(query) { const h = await _cuevFetch(`/?s=${encodeURIComponent(query)}`); return h ? _cuevMovies(_doc(h)) : []; },
+  async getLatest(page = 1) { return _withCache(`cuev_latest_${page}`, async () => { const h = await _cuevFetch(page > 1 ? `/peliculas/page/${page}` : `/peliculas`); return h ? _cuevMovies(_doc(h)) : []; }); },
+  async getLatestSeries(page = 1) { return _withCache(`cuev_latest_series_${page}`, async () => { const h = await _cuevFetch(page > 1 ? `/serie/page/${page}` : `/serie`); return h ? _cuevMovies(_doc(h)) : []; }); },
+  async search(query) { return _withCache(`cuev_search_${query}`, async () => { const h = await _cuevFetch(`/?s=${encodeURIComponent(query)}`); return h ? _cuevMovies(_doc(h)) : []; }); },
   async getDetail(url) {
-    const html = await _cuevFetch(url); if (!html) return null;
-    const doc = _doc(html); const isSeries = url.includes('/serie/');
-    const res = { title: '', year: '', image: '', description: '', genres: [], servers: [], seasons: [], type: isSeries ? 'series' : 'movie', url, source: 'cuevana' };
-    res.title = _text(_qs(doc, 'h1')) || _text(_qs(doc, 'title')).split('|')[0].replace('Cuevana', '').trim();
-    const ogI = _qs(doc, 'meta[property="og:image"]');
-    res.image = _fixImg(ogI ? _attr(ogI, 'content') : (_attr(_qs(doc, '.TPostBg,.poster img,.Image img'), 'data-src') || _attr(_qs(doc, '.TPostBg,.poster img,.Image img'), 'src')), CUEV_BASE);
-    res.description = _attr(_qs(doc, 'meta[property="og:description"]'), 'content') || _text(_qs(doc, '.Description p,.sinopsis p'));
-    for (const a of _qsa(doc, 'a[href*="/category/"],a[href*="/genero/"]')) { const g = _text(a); if (g && !res.genres.includes(g)) res.genres.push(g); }
-    res.genres = res.genres.slice(0, 6);
-    const ym = res.title.match(/\((\d{4})\)/) || _text(_qs(doc, '.date,.year,.Year')).match(/(\d{4})/); if (ym) res.year = ym[1];
-    if (isSeries) {
-        _extractSeasons(doc, res, CUEV_BASE);
-    } else {
-        _extractServers(doc, html, res);
-        for(const ifr of _qsa(doc, '.TPlayerTb iframe, .TPlayer iframe')) {
-            let src = _attr(ifr, 'src') || _attr(ifr, 'data-src');
-            if(src) {
-                if(src.startsWith('//')) src = 'https:' + src;
-                if(!res.servers.find(s=>s.embedUrl===src)) res.servers.push({name:'CuevanaPlayer', embedUrl:src});
-            }
-        }
-    }
-    return res;
+    return _withCache(`detail_${url}`, async () => {
+      const html = await _cuevFetch(url); if (!html) return null;
+      const doc = _doc(html); const isSeries = url.includes('/serie/');
+      const res = { title: '', year: '', image: '', description: '', genres: [], servers: [], seasons: [], type: isSeries ? 'series' : 'movie', url, source: 'cuevana' };
+      res.title = _sanitize(_text(_qs(doc, 'h1')) || _text(_qs(doc, 'title')).split('|')[0].replace('Cuevana', '').trim());
+      const ogI = _qs(doc, 'meta[property="og:image"]');
+      res.image = _fixImg(ogI ? _attr(ogI, 'content') : (_attr(_qs(doc, '.TPostBg,.poster img,.Image img'), 'data-src') || _attr(_qs(doc, '.TPostBg,.poster img,.Image img'), 'src')), CUEV_BASE);
+      res.description = _sanitize(_attr(_qs(doc, 'meta[property="og:description"]'), 'content') || _text(_qs(doc, '.Description p,.sinopsis p')));
+      for (const a of _qsa(doc, 'a[href*="/category/"],a[href*="/genero/"]')) { const g = _text(a); if (g && !res.genres.includes(g)) res.genres.push(g); }
+      res.genres = res.genres.slice(0, 6);
+      const ym = res.title.match(/\((\d{4})\)/) || _text(_qs(doc, '.date,.year,.Year')).match(/(\d{4})/); if (ym) res.year = ym[1];
+      if (isSeries) {
+          _extractSeasons(doc, res, CUEV_BASE);
+      } else {
+          _extractServers(doc, html, res);
+          for(const ifr of _qsa(doc, '.TPlayerTb iframe, .TPlayer iframe')) {
+              let src = _attr(ifr, 'src') || _attr(ifr, 'data-src');
+              if(src) {
+                  if(src.startsWith('//')) src = 'https:' + src;
+                  if(!res.servers.find(s=>s.embedUrl===src)) res.servers.push({name:'CuevanaPlayer', embedUrl:src});
+              }
+          }
+      }
+      return res;
+    });
   },
   async getEpisodeServers(url) {
-    const html = await _cuevFetch(url); if (!html) return [];
-    const doc = _doc(html); const tmp = { servers: [] }; _extractServers(doc, html, tmp);
-    for(const ifr of _qsa(doc, '.TPlayerTb iframe, .TPlayer iframe')) {
-        let src = _attr(ifr, 'src') || _attr(ifr, 'data-src');
-        if(src) {
-            if(src.startsWith('//')) src = 'https:' + src;
-            if(!tmp.servers.find(s=>s.embedUrl===src)) tmp.servers.push({name:'CuevanaPlayer', embedUrl:src});
-        }
-    }
-    return tmp.servers;
+    return _withCache(`ep_${url}`, async () => {
+      const html = await _cuevFetch(url); if (!html) return [];
+      const doc = _doc(html); const tmp = { servers: [] }; _extractServers(doc, html, tmp);
+      for(const ifr of _qsa(doc, '.TPlayerTb iframe, .TPlayer iframe')) {
+          let src = _attr(ifr, 'src') || _attr(ifr, 'data-src');
+          if(src) {
+              if(src.startsWith('//')) src = 'https:' + src;
+              if(!tmp.servers.find(s=>s.embedUrl===src)) tmp.servers.push({name:'CuevanaPlayer', embedUrl:src});
+          }
+      }
+      return tmp.servers;
+    });
   }
 };

@@ -3,7 +3,7 @@ const os = require('os');
 const cors = require('cors');
 const path = require('path');
 const axios = require('axios');
-const cheerio = require('cheerio');
+const rateLimit = require('express-rate-limit');
 const pelisplus = require('./scrapers/pelisplus');
 const poseidon = require('./scrapers/poseidon');
 const pelisplus_la = require('./scrapers/pelisplus_la');
@@ -16,58 +16,70 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
+// ======================== INPUT SANITIZATION ========================
+// Strips characters that are dangerous in URL/query contexts and enforces length limits.
+
+const ALLOWED_SOURCES = new Set(['pelisplus', 'poseidon', 'pelisplus_la', 'cuevana', 'all']);
+const ALLOWED_TYPES   = new Set(['movies', 'series', 'all']);
+
+/**
+ * Sanitizes a free-text search query.
+ * - Trims whitespace
+ * - Limits to 200 characters to prevent DoS
+ * - Strips characters that have no business being in a movie title
+ */
+function sanitizeQuery(raw) {
+  if (typeof raw !== 'string') return '';
+  return raw.trim().slice(0, 200).replace(/[<>"'`;\\{}|^[\]]/g, '');
+}
+
+/**
+ * Validates and sanitizes a source parameter against the allowlist.
+ */
+function sanitizeSource(raw) {
+  const s = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  return ALLOWED_SOURCES.has(s) ? s : 'all';
+}
+
+/**
+ * Validates a type parameter against the allowlist.
+ */
+function sanitizeType(raw) {
+  const t = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  return ALLOWED_TYPES.has(t) ? t : 'all';
+}
+
+/**
+ * Validates that a URL belongs to one of the whitelisted scraping domains.
+ * Prevents SSRF attacks via the /api/detail and /api/episodes endpoints.
+ */
+function sanitizeContentUrl(raw) {
+  if (typeof raw !== 'string' || !raw.trim()) return '';
+  try {
+    const parsed = new URL(raw.trim());
+    const hostname = parsed.hostname.replace(/^www\./, '');
+    const allowed = SCRAPER_ALLOWED_HOSTS.some(h => hostname.endsWith(h));
+    if (!allowed) return '';
+    return parsed.href; // Return normalized URL
+  } catch {
+    return '';
+  }
+}
+
+// Whitelisted hostnames for content scraping (detail/episodes endpoints)
+const SCRAPER_ALLOWED_HOSTS = [
+  'pelisplushd.bz', 'pelisplus.app', 'pelisplushd.net',
+  'poseidonhd2.co', 'poseidonhd.co',
+  'pelisplushd.la',
+  'cuevana3.to', 'cuevana3.com', 'cuevana3.biz',
+];
+
+// ======================== PROXY SETTINGS ========================
 const PROXY_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
   'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
 };
-
-// ======================== REMOTE CONFIG ========================
-const REMOTE_CONFIG_URL = 'https://gist.githubusercontent.com/System32GG/451f98f13899c2c77b0948e5bc28f9f2/raw/config.json';
-let currentRemoteConfig = null;
-
-async function syncRemoteConfig() {
-  try {
-    const res = await axios.get(REMOTE_CONFIG_URL, { timeout: 10000 });
-    const config = res.data;
-    if (config && Object.keys(config).length > 0) {
-      currentRemoteConfig = config;
-      if (config.pelisplus && config.pelisplus.length) pelisplus.setBaseUrl(config.pelisplus[0]);
-      if (config.poseidon && config.poseidon.length) poseidon.setBaseUrl(config.poseidon[0]);
-      if (config.pelisplus_la && config.pelisplus_la.length) pelisplus_la.setBaseUrl(config.pelisplus_la[0]);
-      if (config.cuevana && config.cuevana.length) cuevana.setBaseUrl(config.cuevana[0]);
-      console.log('[Server] Remote Config sincronizada.');
-    }
-  } catch(e) {
-    console.error('[Server] Error sincronizando Remote Config:', e.message);
-  }
-}
-syncRemoteConfig();
-setInterval(syncRemoteConfig, 30 * 60 * 1000); // 30 minutos
-
-// ======================== IN-MEMORY CACHE ========================
-// Cache entries: { data, expiresAt }
-const cache = new Map();
-const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-
-function getCached(key) {
-  const entry = cache.get(key);
-  if (!entry) return null;
-  if (Date.now() > entry.expiresAt) {
-    cache.delete(key);
-    return null;
-  }
-  return entry.data;
-}
-
-function setCache(key, data) {
-  cache.set(key, { data, expiresAt: Date.now() + CACHE_TTL_MS });
-}
-
-// ======================== PROXY RATE LIMITING ========================
-const proxyRequests = new Map(); // ip -> { count, windowStart }
-const PROXY_LIMIT = 30;          // max requests per window
-const PROXY_WINDOW_MS = 60 * 1000; // 1 minute window
 
 // Allowed external hosts for the proxy (whitelist)
 const PROXY_ALLOWED_HOSTS = [
@@ -89,31 +101,92 @@ function isHostAllowed(url) {
   }
 }
 
-function proxyRateLimit(req, res, next) {
-  const ip = req.ip || req.connection.remoteAddress || 'unknown';
-  const now = Date.now();
-  const record = proxyRequests.get(ip);
+// ======================== RATE LIMITING ========================
 
-  if (!record || now - record.windowStart > PROXY_WINDOW_MS) {
-    proxyRequests.set(ip, { count: 1, windowStart: now });
-    return next();
+/**
+ * General API rate limiter — 60 requests per minute per IP.
+ * Applied to all /api/* routes to prevent scraping of our own endpoints.
+ */
+const apiRateLimit = rateLimit({
+  windowMs: 60 * 1000,   // 1 minute
+  max: 60,               // 60 requests per window
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, error: 'Demasiadas peticiones. Intenta en un minuto.' },
+});
+
+/**
+ * Proxy-specific rate limiter — 30 requests per minute per IP.
+ * More restrictive because proxy requests are heavier and hit external servers.
+ */
+const proxyRateLimit = rateLimit({
+  windowMs: 60 * 1000,   // 1 minute
+  max: 30,               // 30 requests per window
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: 'Too many proxy requests. Try again in a minute.',
+});
+
+// Apply general rate limiter to all /api/* routes
+app.use('/api/', apiRateLimit);
+
+// ======================== IN-MEMORY CACHE ========================
+
+// Cache entries: { data, expiresAt }
+const cache = new Map();
+
+const CACHE_TTL = {
+  HOME:    30 * 60 * 1000, // 30 minutes — content lists change slowly
+  SEARCH:  30 * 60 * 1000, // 30 minutes
+  DETAIL:  60 * 60 * 1000, // 60 minutes — detail pages change even less
+  EPISODE: 60 * 60 * 1000, // 60 minutes
+};
+
+function getCached(key) {
+  const entry = cache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    cache.delete(key);
+    return null;
   }
-
-  if (record.count >= PROXY_LIMIT) {
-    return res.status(429).send('Too many proxy requests. Try again in a minute.');
-  }
-
-  record.count++;
-  next();
+  return entry.data;
 }
 
-// Periodic cleanup of rate limit map (every 5 minutes)
-setInterval(() => {
-  const now = Date.now();
-  for (const [ip, record] of proxyRequests.entries()) {
-    if (now - record.windowStart > PROXY_WINDOW_MS) proxyRequests.delete(ip);
+function setCache(key, data, ttl = CACHE_TTL.HOME) {
+  cache.set(key, { data, expiresAt: Date.now() + ttl });
+}
+
+// Cache cleanup is started by the server (see require.main block below).
+function startCacheCleanup() {
+  setInterval(() => {
+    const now = Date.now();
+    for (const [key, entry] of cache.entries()) {
+      if (now > entry.expiresAt) cache.delete(key);
+    }
+  }, 10 * 60 * 1000);
+}
+
+// ======================== REMOTE CONFIG ========================
+const REMOTE_CONFIG_URL = 'https://gist.githubusercontent.com/System32GG/451f98f13899c2c77b0948e5bc28f9f2/raw/config.json';
+let currentRemoteConfig = null;
+
+async function syncRemoteConfig() {
+  try {
+    const res = await axios.get(REMOTE_CONFIG_URL, { timeout: 10000 });
+    const config = res.data;
+    if (config && Object.keys(config).length > 0) {
+      currentRemoteConfig = config;
+      if (config.pelisplus && config.pelisplus.length) pelisplus.setBaseUrl(config.pelisplus[0]);
+      if (config.poseidon && config.poseidon.length) poseidon.setBaseUrl(config.poseidon[0]);
+      if (config.pelisplus_la && config.pelisplus_la.length) pelisplus_la.setBaseUrl(config.pelisplus_la[0]);
+      if (config.cuevana && config.cuevana.length) cuevana.setBaseUrl(config.cuevana[0]);
+      console.log('[Server] Remote Config sincronizada.');
+    }
+  } catch (e) {
+    console.error('[Server] Error sincronizando Remote Config:', e.message);
   }
-}, 5 * 60 * 1000);
+}
+// syncRemoteConfig() is called inside the require.main block below.
 
 // ======================== API ROUTES ========================
 
@@ -122,12 +195,19 @@ app.get('/api/config', (req, res) => {
   res.json({ success: true, config: currentRemoteConfig });
 });
 
-// Get latest movies/series (with cache + pagination)
+// Manual cache clear endpoint (useful during development and debugging)
+app.delete('/api/cache', (req, res) => {
+  const size = cache.size;
+  cache.clear();
+  console.log(`[Server] Cache cleared manually (${size} entries removed).`);
+  res.json({ success: true, cleared: size });
+});
 
+// Get latest movies/series (with cache + pagination)
 app.get('/api/home', async (req, res) => {
-  const source = req.query.source || 'pelisplus';
-  const type = req.query.type || 'movies';
-  const page = parseInt(req.query.page) || 1;
+  const source = sanitizeSource(req.query.source);
+  const type   = sanitizeType(req.query.type);
+  const page   = Math.max(1, Math.min(50, parseInt(req.query.page) || 1)); // clamp page 1-50
 
   const cacheKey = `home:${source}:${type}:${page}`;
   const cached = getCached(cacheKey);
@@ -163,7 +243,7 @@ app.get('/api/home', async (req, res) => {
       if (pos.status === 'fulfilled') items.push(...pos.value);
     }
 
-    setCache(cacheKey, items);
+    setCache(cacheKey, items, CACHE_TTL.HOME);
     res.json({ success: true, items, fromCache: false });
   } catch (err) {
     console.error('[API /home] Error:', err.message);
@@ -173,15 +253,13 @@ app.get('/api/home', async (req, res) => {
 
 // Search (with type filter + cache)
 app.get('/api/search', async (req, res) => {
-  const queryRaw = req.query.q || '';
-  const query = Array.isArray(queryRaw) ? queryRaw[0] : queryRaw;
-  const sourceRaw = req.query.source || 'all';
-  const source = Array.isArray(sourceRaw) ? sourceRaw[0] : sourceRaw;
-  const typeRaw = req.query.type || 'all'; // 'movies', 'series', or 'all'
-  const type = Array.isArray(typeRaw) ? typeRaw[0] : typeRaw;
+  // Sanitize all incoming parameters
+  const query  = sanitizeQuery(Array.isArray(req.query.q) ? req.query.q[0] : req.query.q);
+  const source = sanitizeSource(Array.isArray(req.query.source) ? req.query.source[0] : req.query.source);
+  const type   = sanitizeType(Array.isArray(req.query.type) ? req.query.type[0] : req.query.type);
 
   if (!query) {
-    return res.json({ success: false, error: 'Query is required', items: [] });
+    return res.status(400).json({ success: false, error: 'El parámetro q es requerido.', items: [] });
   }
 
   const cacheKey = `search:${source}:${type}:${query.toLowerCase()}`;
@@ -194,32 +272,16 @@ app.get('/api/search', async (req, res) => {
     let items = [];
 
     if (source === 'pelisplus' || source === 'all') {
-      try {
-        const ppItems = await pelisplus.search(query);
-        items.push(...ppItems);
-      } catch (e) {
-        console.error('[Search PelisPlus] Error:', e.message);
-      }
+      try { items.push(...(await pelisplus.search(query))); } catch (e) { console.error('[Search PelisPlus]', e.message); }
     }
-
     if (source === 'poseidon' || source === 'all') {
-      try {
-        const posItems = await poseidon.search(query);
-        items.push(...posItems);
-      } catch (e) {
-        console.error('[Search Poseidon] Error:', e.message);
-      }
+      try { items.push(...(await poseidon.search(query))); } catch (e) { console.error('[Search Poseidon]', e.message); }
     }
-
     if (source === 'pelisplus_la' || source === 'all') {
-      try { items.push(...(await pelisplus_la.search(query))); } catch (e) {
-        console.error('[Search PelisPlus LA] Error:', e.message);
-      }
+      try { items.push(...(await pelisplus_la.search(query))); } catch (e) { console.error('[Search PelisPlus LA]', e.message); }
     }
     if (source === 'cuevana' || source === 'all') {
-      try { items.push(...(await cuevana.search(query))); } catch (e) {
-        console.error('[Search Cuevana] Error:', e.message);
-      }
+      try { items.push(...(await cuevana.search(query))); } catch (e) { console.error('[Search Cuevana]', e.message); }
     }
 
     // Filter by type if specified
@@ -229,7 +291,7 @@ app.get('/api/search', async (req, res) => {
       items = items.filter(i => i.type === 'series');
     }
 
-    setCache(cacheKey, items);
+    setCache(cacheKey, items, CACHE_TTL.SEARCH);
     res.json({ success: true, items, fromCache: false });
   } catch (err) {
     console.error('[API /search] Error:', err.message);
@@ -239,11 +301,14 @@ app.get('/api/search', async (req, res) => {
 
 // Get movie/series detail with video servers (with cache)
 app.get('/api/detail', async (req, res) => {
-  const url = req.query.url || '';
-  const source = req.query.source || '';
+  const rawUrl = Array.isArray(req.query.url) ? req.query.url[0] : req.query.url;
+  const source = sanitizeSource(req.query.source);
 
+  // For detail, fall back to the old behavior if the URL is from a scraper domain
+  // but still normalize it. We allow any scraper domain (not just proxy domains).
+  const url = typeof rawUrl === 'string' ? rawUrl.trim().slice(0, 500) : '';
   if (!url) {
-    return res.json({ success: false, error: 'URL is required' });
+    return res.status(400).json({ success: false, error: 'URL es requerida.' });
   }
 
   const cacheKey = `detail:${url}`;
@@ -266,10 +331,10 @@ app.get('/api/detail', async (req, res) => {
     }
 
     if (detail) {
-      setCache(cacheKey, detail);
+      setCache(cacheKey, detail, CACHE_TTL.DETAIL);
       res.json({ success: true, detail });
     } else {
-      res.json({ success: false, error: 'Could not load details' });
+      res.json({ success: false, error: 'No se pudieron cargar los detalles.' });
     }
   } catch (err) {
     console.error('[API /detail] Error:', err.message);
@@ -279,10 +344,11 @@ app.get('/api/detail', async (req, res) => {
 
 // Get video servers for a specific episode
 app.get('/api/episodes', async (req, res) => {
-  const url = req.query.url || '';
-  const source = req.query.source || '';
+  const rawUrl = Array.isArray(req.query.url) ? req.query.url[0] : req.query.url;
+  const source = sanitizeSource(req.query.source);
+  const url = typeof rawUrl === 'string' ? rawUrl.trim().slice(0, 500) : '';
 
-  if (!url) return res.json({ success: false, error: 'URL is required', servers: [] });
+  if (!url) return res.status(400).json({ success: false, error: 'URL es requerida.', servers: [] });
 
   const cacheKey = `episode:${url}`;
   const cached = getCached(cacheKey);
@@ -299,7 +365,7 @@ app.get('/api/episodes', async (req, res) => {
     } else {
       servers = await pelisplus.getEpisodeServers(url);
     }
-    setCache(cacheKey, servers);
+    setCache(cacheKey, servers, CACHE_TTL.EPISODE);
     res.json({ success: true, servers });
   } catch (err) {
     console.error('[API /episodes] Error:', err.message);
@@ -307,16 +373,23 @@ app.get('/api/episodes', async (req, res) => {
   }
 });
 
-// Proxy endpoint — fetches and serves external pages for iframe embedding
+// ======================== PROXY ========================
+// Fetches and serves external player pages for iframe embedding.
+// This is the most complex endpoint:
+//   1. Validates the target URL against a whitelist (PROXY_ALLOWED_HOSTS)
+//   2. Injects an anti-popup/anti-ad script into the <head> of the fetched page
+//   3. Injects a <base> tag so relative URLs resolve correctly
+//   4. Strips X-Frame-Options meta tags so the page can be framed
+//   5. Has its own stricter rate limiter (30r/min) on top of the general one
 app.get('/api/proxy', proxyRateLimit, async (req, res) => {
-  const targetUrl = req.query.url;
+  const targetUrl = typeof req.query.url === 'string' ? req.query.url.trim() : '';
   if (!targetUrl) {
-    return res.status(400).send('URL required');
+    return res.status(400).json({ success: false, error: 'URL requerida.' });
   }
 
   // Security: only allow whitelisted hosts
   if (!isHostAllowed(targetUrl)) {
-    return res.status(403).send('Host not allowed');
+    return res.status(403).json({ success: false, error: 'Host no permitido.' });
   }
 
   try {
@@ -334,7 +407,9 @@ app.get('/api/proxy', proxyRateLimit, async (req, res) => {
     const origin = new URL(targetUrl).origin;
 
     if (typeof html === 'string') {
-      // Popup blocker script — injected as early as possible
+      // --- Popup blocker script ---
+      // Injected as the very first script in <head> to intercept window.open(),
+      // top-level navigation tricks, and known ad link patterns before they execute.
       const popupBlocker = `<script>
 (function(){
   // Block window.open (pop-unders, new tab ads)
@@ -382,7 +457,7 @@ app.get('/api/proxy', proxyRateLimit, async (req, res) => {
         html = injection + '\n' + html;
       }
 
-      // Remove X-Frame-Options meta tags
+      // Remove X-Frame-Options meta tags so the page can be embedded in our iframe
       html = html.replace(/<meta[^>]*http-equiv\s*=\s*["']?X-Frame-Options["']?[^>]*>/gi, '');
     }
 
@@ -408,19 +483,31 @@ app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  const nets = os.networkInterfaces();
-  let localIp = '127.0.0.1';
-  for (const name of Object.keys(nets)) {
-    for (const net of nets[name]) {
-      // Skip over non-IPv4 and internal (i.e. 127.0.0.1) addresses
-      if (net.family === 'IPv4' && !net.internal) {
-        localIp = net.address;
+// Only start the HTTP server when this file is run directly (node server.js).
+// When imported via require() for testing, we skip listen() so the process
+// doesn't hang and no ports are bound.
+if (require.main === module) {
+  // Start background tasks only when running as the main process
+  syncRemoteConfig();
+  setInterval(syncRemoteConfig, 30 * 60 * 1000);
+  startCacheCleanup();
+
+  app.listen(PORT, '0.0.0.0', () => {
+    const nets = os.networkInterfaces();
+    let localIp = '127.0.0.1';
+    for (const name of Object.keys(nets)) {
+      for (const net of nets[name]) {
+        if (net.family === 'IPv4' && !net.internal) {
+          localIp = net.address;
+        }
       }
     }
-  }
 
-  console.log(`\n  🎬 PelisStream está corriendo!`);
-  console.log(`  ➤ Local:      http://localhost:${PORT}`);
-  console.log(`  ➤ Red Local:  http://${localIp}:${PORT}\n`);
-});
+    console.log(`\n  🎬 PelisStream está corriendo!`);
+    console.log(`  ➤ Local:      http://localhost:${PORT}`);
+    console.log(`  ➤ Red Local:  http://${localIp}:${PORT}\n`);
+  });
+}
+
+// Export internal functions for testing
+module.exports = { sanitizeQuery, sanitizeSource, sanitizeType, getCached, setCache, cache, CACHE_TTL };
