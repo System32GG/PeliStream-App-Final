@@ -1,6 +1,6 @@
 # PeliStream
 
-Agregador de streaming para películas y series. Diseñado para funcionar como servidor local (Node.js) y como aplicación nativa en Android TV.
+Agregador de streaming para películas y series. Diseñado para funcionar como servidor local (Node.js) y como aplicación nativa en Android/Android TV.
 
 ## 🚀 Inicio Rápido
 
