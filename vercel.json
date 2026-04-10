@@ -3,7 +3,7 @@
   "rewrites": [
     {
       "source": "/api/:path*",
-      "destination": "https://TU_URL_DE_RENDER.onrender.com/api/:path*"
+      "destination": "https://pelistream-backend.onrender.com/api/:path*"
     }
   ],
   "cleanUrls": true
