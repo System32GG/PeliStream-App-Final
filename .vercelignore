@@ -1,0 +1,18 @@
+# Ignorar archivos del backend para que Vercel no intente ejecutarlos
+server.js
+render.yaml
+scrapers/
+tests/
+server.log
+tmp_*.html
+Codigo.txt
+Iniciar.vbs
+Parar.bat
+Documentacion/
+node_modules/
+package.json
+package-lock.json
+capacitor.config.ts
+android/
+icons/
+assets/
