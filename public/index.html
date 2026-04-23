@@ -5,8 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="description" content="PelisStream - Ver películas y series online gratis en HD">
   <title>PelisStream — Películas y Series Online</title>
-  <!-- Umami Analytics -->
-  <script defer src="https://cloud.umami.is/script.js" data-website-id="c5e10e3f-72b7-4ffa-b44f-5667f0cbe48f"></script>
+  <!-- Umami Analytics (proxied via own server to bypass ad blockers) -->
+  <script defer
+    src="/stats/script.js"
+    data-website-id="c5e10e3f-72b7-4ffa-b44f-5667f0cbe48f"
+    data-host-url="/stats">
+  </script>
   <!-- Popup / redirect blocker: prevents iframes from opening new windows in the parent context -->
   <script>
     // Override window.open so iframes cannot spawn pop-under ad windows
