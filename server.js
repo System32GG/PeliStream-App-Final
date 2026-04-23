@@ -203,6 +203,35 @@ app.delete('/api/cache', (req, res) => {
   res.json({ success: true, cleared: size });
 });
 
+// ======================== UMAMI PROXY ========================
+// Sirve el script de Umami y reenvía los eventos desde el propio dominio,
+// evitando que bloqueadores como Brave Shields lo detecten como tracker externo.
+
+app.get('/stats/script.js', async (req, res) => {
+  try {
+    const r = await axios.get('https://cloud.umami.is/script.js', { timeout: 10000 });
+    res.setHeader('Content-Type', 'application/javascript');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.send(r.data);
+  } catch (e) {
+    console.error('[Umami] Error al obtener script:', e.message);
+    res.status(502).send('');
+  }
+});
+
+app.post('/stats/api/send', async (req, res) => {
+  try {
+    const r = await axios.post('https://cloud.umami.is/api/send', req.body, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 10000,
+    });
+    res.json(r.data);
+  } catch (e) {
+    console.error('[Umami] Error al enviar evento:', e.message);
+    res.status(502).json({});
+  }
+});
+
 // Get latest movies/series (with cache + pagination)
 app.get('/api/home', async (req, res) => {
   const source = sanitizeSource(req.query.source);
@@ -304,8 +333,6 @@ app.get('/api/detail', async (req, res) => {
   const rawUrl = Array.isArray(req.query.url) ? req.query.url[0] : req.query.url;
   const source = sanitizeSource(req.query.source);
 
-  // For detail, fall back to the old behavior if the URL is from a scraper domain
-  // but still normalize it. We allow any scraper domain (not just proxy domains).
   const url = typeof rawUrl === 'string' ? rawUrl.trim().slice(0, 500) : '';
   if (!url) {
     return res.status(400).json({ success: false, error: 'URL es requerida.' });
@@ -374,20 +401,12 @@ app.get('/api/episodes', async (req, res) => {
 });
 
 // ======================== PROXY ========================
-// Fetches and serves external player pages for iframe embedding.
-// This is the most complex endpoint:
-//   1. Validates the target URL against a whitelist (PROXY_ALLOWED_HOSTS)
-//   2. Injects an anti-popup/anti-ad script into the <head> of the fetched page
-//   3. Injects a <base> tag so relative URLs resolve correctly
-//   4. Strips X-Frame-Options meta tags so the page can be framed
-//   5. Has its own stricter rate limiter (30r/min) on top of the general one
 app.get('/api/proxy', proxyRateLimit, async (req, res) => {
   const targetUrl = typeof req.query.url === 'string' ? req.query.url.trim() : '';
   if (!targetUrl) {
     return res.status(400).json({ success: false, error: 'URL requerida.' });
   }
 
-  // Security: only allow whitelisted hosts
   if (!isHostAllowed(targetUrl)) {
     return res.status(403).json({ success: false, error: 'Host no permitido.' });
   }
@@ -407,24 +426,18 @@ app.get('/api/proxy', proxyRateLimit, async (req, res) => {
     const origin = new URL(targetUrl).origin;
 
     if (typeof html === 'string') {
-      // --- Popup blocker script ---
-      // Injected as the very first script in <head> to intercept window.open(),
-      // top-level navigation tricks, and known ad link patterns before they execute.
       const popupBlocker = `<script>
 (function(){
-  // Block window.open (pop-unders, new tab ads)
   var _open = window.open;
   window.open = function(url, name, specs) {
     if (!url || url === '' || url === 'about:blank') return _open.apply(this, arguments);
     console.warn('[PelisStream] Blocked popup:', url);
     return null;
   };
-  // Block top-level navigation tricks (window.top.location, window.parent.location)
   try {
     Object.defineProperty(window, 'top', { get: function(){ return window; } });
     Object.defineProperty(window, 'parent', { get: function(){ return window; } });
   } catch(e){}
-  // Block document.write-based redirects on body click
   document.addEventListener('click', function(e) {
     var t = e.target;
     while (t) {
@@ -447,7 +460,6 @@ app.get('/api/proxy', proxyRateLimit, async (req, res) => {
 })();
 <\/script>`;
 
-      // Inject popup blocker + base tag into <head>
       const injection = `<base href="${origin}/">` + popupBlocker;
       if (html.includes('<head>')) {
         html = html.replace('<head>', `<head>${injection}`);
@@ -457,7 +469,6 @@ app.get('/api/proxy', proxyRateLimit, async (req, res) => {
         html = injection + '\n' + html;
       }
 
-      // Remove X-Frame-Options meta tags so the page can be embedded in our iframe
       html = html.replace(/<meta[^>]*http-equiv\s*=\s*["']?X-Frame-Options["']?[^>]*>/gi, '');
     }
 
@@ -483,11 +494,7 @@ app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// Only start the HTTP server when this file is run directly (node server.js).
-// When imported via require() for testing, we skip listen() so the process
-// doesn't hang and no ports are bound.
 if (require.main === module) {
-  // Start background tasks only when running as the main process
   syncRemoteConfig();
   setInterval(syncRemoteConfig, 30 * 60 * 1000);
   startCacheCleanup();
@@ -509,5 +516,4 @@ if (require.main === module) {
   });
 }
 
-// Export internal functions for testing
 module.exports = { sanitizeQuery, sanitizeSource, sanitizeType, getCached, setCache, cache, CACHE_TTL };
