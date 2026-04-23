@@ -207,7 +207,7 @@ app.delete('/api/cache', (req, res) => {
 // Sirve el script de Umami y reenvía los eventos desde el propio dominio,
 // evitando que bloqueadores como Brave Shields lo detecten como tracker externo.
 
-app.get('/stats/script.js', async (req, res) => {
+app.get('/js/main.js', async (req, res) => {
   try {
     const r = await axios.get('https://cloud.umami.is/script.js', { timeout: 10000 });
     res.setHeader('Content-Type', 'application/javascript');
@@ -219,7 +219,7 @@ app.get('/stats/script.js', async (req, res) => {
   }
 });
 
-app.post('/stats/api/send', async (req, res) => {
+app.post('/js/collect', async (req, res) => {
   try {
     const r = await axios.post('https://cloud.umami.is/api/send', req.body, {
       headers: { 'Content-Type': 'application/json' },
